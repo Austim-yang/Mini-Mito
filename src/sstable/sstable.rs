@@ -88,7 +88,10 @@ impl SstableIndex {
         let bits = base64::engine::general_purpose::STANDARD
             .decode(dto.bloom.bits)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if dto.bloom.m < 1024 || dto.bloom.k == 0 || bits.len() != ((dto.bloom.m + 7) / 8) as usize
+        if dto.bloom.m < 1024
+            || dto.bloom.k == 0
+            || dto.bloom.k > 64
+            || bits.len() != ((dto.bloom.m + 7) / 8) as usize
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
