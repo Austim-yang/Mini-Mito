@@ -35,8 +35,7 @@ pub struct LSMStream {
     table_schema: Arc<TableSchema>,
     user_schema: SchemaRef,
     merge: MergeBatchIter,
-    batches: Vec<RecordBatch>,
-    index: usize,
+    current: Option<RecordBatch>,
     emitted: usize,
     finished: bool,
 }
@@ -52,15 +51,12 @@ impl Stream for LSMStream {
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.index < this.batches.len() {
-            let batch = this.batches[this.index].clone();
-            this.index += 1;
+        if let Some(batch) = this.current.take() {
             return Poll::Ready(Some(Ok(batch)));
         }
         match this.refill() {
             Ok(true) => {
-                let batch = this.batches[this.index].clone();
-                this.index += 1;
+                let batch = this.current.take().expect("refill reported a batch");
                 Poll::Ready(Some(Ok(batch)))
             }
             Ok(false) => Poll::Ready(None),
@@ -91,8 +87,7 @@ impl LSMStream {
             table_schema,
             user_schema,
             merge,
-            batches: Vec::new(),
-            index: 0,
+            current: None,
             emitted: 0,
             finished: false,
         })
@@ -120,8 +115,8 @@ impl LSMStream {
     }
 
     fn refill(&mut self) -> DataFusionResult<bool> {
-        if self.finished || self.batches.len() > self.index {
-            return Ok(!self.finished && !self.batches.is_empty());
+        if self.finished || self.current.is_some() {
+            return Ok(!self.finished && !self.current.is_some());
         }
         loop {
             let Some(result) = self.merge.next() else {
@@ -144,13 +139,13 @@ impl LSMStream {
                 if projected.num_rows() >= remaining {
                     let sliced = projected.slice(0, remaining);
                     self.emitted += remaining;
-                    self.batches.push(sliced);
+                    self.current = Some(sliced);
                     self.finished = true;
                     return Ok(true);
                 }
                 self.emitted += projected.num_rows();
             }
-            self.batches.push(projected);
+            self.current = Some(projected);
             return Ok(true);
         }
     }
@@ -206,5 +201,42 @@ mod tests {
             }
         }
         assert_eq!(rows, vec![(vec![1], 10), (vec![2], 10), (vec![3], 10)]);
+    }
+
+    #[test]
+    fn test_lsm_stream_streams_multiple_batches() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let region = Region::new(&path).unwrap();
+        for i in 0..25_000i64 {
+            region.write(key(7, i), val("x")).unwrap();
+        }
+        region.flush().unwrap();
+
+        let region = Arc::new(region);
+        let schema = Arc::new(region.schema().arrow_schema());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let stream = LSMStream::new(region, schema, None, None, TimeRange::unbounded()).unwrap();
+        let batches: Vec<_> = rt.block_on(async { stream.collect::<Vec<_>>().await });
+
+        let mut total = 0usize;
+        let mut last_ts: Option<i64> = None;
+        for b in batches {
+            let b = b.unwrap();
+            assert!(b.num_rows() <= 10_000);
+            let col = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                let ts = col.value(i);
+                assert_eq!(ts, total as i64, "rows must arrive in order");
+                last_ts = Some(ts);
+                total += 1;
+            }
+        }
+        assert_eq!(total, 25_000);
+        assert_eq!(last_ts, Some(24_999));
     }
 }
