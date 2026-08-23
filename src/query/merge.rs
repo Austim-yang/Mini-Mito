@@ -11,7 +11,7 @@ use futures::io;
 use crate::{
     memtable::version::Source,
     schema::{BatchView, TableSchema, TypedBuilder},
-    sstable::sstable::sst_schema,
+    sstable::sstable::{OP_DELETE, sst_schema},
 };
 
 const BATCH_ROWS: usize = 10_000;
@@ -261,7 +261,9 @@ impl MergeBatchIter {
                 let Reverse(dup) = self.heap.pop().unwrap();
                 self.advance(dup.src, dup.row)?;
             }
-            self.emit(&top);
+            if top.key.op != OP_DELETE {
+                self.emit(&top);
+            }
             self.advance(top.src, top.row)?;
             if self.buffered >= BATCH_ROWS {
                 return Ok(Some(self.take_output()?));
@@ -288,7 +290,7 @@ mod tests {
     use crate::{
         Key, Value,
         schema::SemanticType,
-        sstable::sstable::{OP_DELETE, OP_PUT, internal_batch_from_rows, key_at, value_at},
+        sstable::sstable::{OP_PUT, internal_batch_from_rows, key_at, value_at},
     };
 
     fn default_schema() -> Arc<TableSchema> {
@@ -357,15 +359,14 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_tombstone_kept_as_delete_row() {
+    fn test_merge_drops_winning_tombstone() {
         let schema = default_schema();
         let sources = vec![
             mem_source(&schema, vec![((vec![1], 50), 20, None)]),
             mem_source(&schema, vec![((vec![1], 50), 10, Some(b"old".to_vec()))]),
         ];
         let got = merged_rows(MergeBatchIter::new(sources, schema.clone()), &schema);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0], ((vec![1], 50), 20, OP_DELETE, None));
+        assert_eq!(got.len(), 0, "winning tombstone must not be materialized");
     }
 
     #[test]

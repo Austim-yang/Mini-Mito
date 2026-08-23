@@ -5,10 +5,6 @@ use std::{
     task::{Context, Poll},
 };
 
-use arrow::{
-    array::{BooleanArray, Int8Array},
-    compute::filter_record_batch,
-};
 use datafusion::{
     arrow::{
         array::{ArrayRef, RecordBatch},
@@ -25,7 +21,6 @@ use crate::{
     memtable::memtable::Region,
     query::{merge::MergeBatchIter, predicate::TimeRange},
     schema::TableSchema,
-    sstable::sstable::OP_DELETE,
 };
 
 pub struct LSMStream {
@@ -95,21 +90,7 @@ impl LSMStream {
 
     fn strip_internal(&self, batch: &RecordBatch) -> DataFusionResult<RecordBatch> {
         let ncols = self.table_schema.columns.len();
-        let op = batch
-            .column(ncols + 1)
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .expect("__op_type must be Int8");
-        let has_delete = op.iter().flatten().any(|v| v == OP_DELETE);
-        let filtered = if has_delete {
-            let mask: BooleanArray =
-                BooleanArray::from_iter(op.iter().map(|v| v != Some(OP_DELETE)));
-            filter_record_batch(batch, &mask)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
-        } else {
-            batch.clone()
-        };
-        let arrays: Vec<ArrayRef> = (0..ncols).map(|c| filtered.column(c).clone()).collect();
+        let arrays: Vec<ArrayRef> = (0..ncols).map(|c| batch.column(c).clone()).collect();
         RecordBatch::try_new(self.user_schema.clone(), arrays)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
