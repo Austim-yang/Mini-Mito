@@ -241,7 +241,7 @@ fn write_manifest(version: &Mutex<Arc<Version>>, manifest_path: &Path) -> io::Re
 
 fn deferred_remove(path: &Path, pending: &Mutex<Vec<PathBuf>>) {
     if let Err(e) = fs::remove_file(path) {
-        eprintln!("mito: deferring delete of {}: {e}", path.display());
+        eprintln!("deferring delete of {}: {e}", path.display());
         pending.lock().unwrap().push(path.to_path_buf());
     }
 }

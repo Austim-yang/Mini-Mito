@@ -6,7 +6,15 @@ use rand::{RngExt, rng};
 use tempfile::tempdir;
 
 fn key(i: u64) -> (Vec<u8>, i64) {
-    (vec![i as u8], i as i64)
+    (
+        vec![
+            ((i >> 24) & 0xff) as u8,
+            ((i >> 16) & 0xff) as u8,
+            ((i >> 8) & 0xff) as u8,
+            (i & 0xff) as u8,
+        ],
+        i as i64,
+    )
 }
 
 fn value(i: u64) -> Vec<u8> {
