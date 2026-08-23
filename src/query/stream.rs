@@ -69,9 +69,11 @@ impl LSMStream {
         time_range: TimeRange,
     ) -> io::Result<Self> {
         let table_schema = region.schema();
+        let user_cols: Option<Vec<usize>> =
+            projection.as_ref().map(|idx| idx.iter().copied().collect());
         let sources = match time_range.to_inclusive_bounds() {
             None => Vec::new(),
-            Some(b) => region.snapshot_columnar_sources(Some(b))?,
+            Some(b) => region.snapshot_columnar_sources(Some(b), user_cols.as_deref())?,
         };
         let user_schema = Arc::new(table_schema.arrow_schema());
         let merge = MergeBatchIter::new(sources, table_schema.clone());
@@ -219,5 +221,38 @@ mod tests {
         }
         assert_eq!(total, 25_000);
         assert_eq!(last_ts, Some(24_999));
+    }
+
+    #[test]
+    fn test_lsm_stream_projection_end_to_end() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let mut region = Region::new(&path).unwrap();
+        region.set_flush_threshold(2);
+        for i in 0..6i64 {
+            region.write(key(9, i), val("x")).unwrap();
+        }
+        region.flush().unwrap();
+
+        let region = Arc::new(region);
+        let full = region.schema().arrow_schema();
+        let projected = Arc::new(full.project(&[0, 1]).unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let stream = LSMStream::new(
+            region,
+            projected,
+            Some(vec![0, 1]),
+            None,
+            TimeRange::unbounded(),
+        )
+        .unwrap();
+        let batches: Vec<_> = rt.block_on(async { stream.collect::<Vec<_>>().await });
+        let mut total = 0usize;
+        for b in batches {
+            let b = b.unwrap();
+            assert_eq!(b.num_columns(), 2);
+            total += b.num_rows();
+        }
+        assert_eq!(total, 6);
     }
 }

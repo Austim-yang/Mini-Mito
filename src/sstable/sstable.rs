@@ -12,16 +12,16 @@ use arrow::{
     array::{ArrayRef, BooleanArray, Int8Array, Int64Array, RecordBatch},
     compute::filter_record_batch,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use base64::Engine;
 use parquet::{
-    arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
+    arrow::{ArrowWriter, ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder},
     file::properties::WriterProperties,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    schema::{BatchView, SemanticType, TableSchema, cells_to_array},
+    schema::{BatchView, SemanticType, TableSchema, cells_to_array, null_array},
     sstable::bloom::BloomFilter,
     types::{Key, Value},
 };
@@ -346,6 +346,26 @@ pub(crate) fn internal_batch_from_rows(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+fn rebuild_full_width(
+    decoded: RecordBatch,
+    proj: &[usize],
+    sst: &SchemaRef,
+) -> io::Result<RecordBatch> {
+    let n = decoded.num_rows();
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(sst.fields().len());
+    let mut k = 0usize;
+    for c in 0..sst.fields().len() {
+        if k < proj.len() && proj[k] == c {
+            arrays.push(decoded.column(k).clone());
+            k += 1;
+        } else {
+            arrays.push(null_array(sst.field(c).data_type(), n));
+        }
+    }
+    RecordBatch::try_new(sst.clone(), arrays)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 #[derive(Clone, Debug)]
 pub struct SSTable {
     id: usize,
@@ -650,6 +670,29 @@ impl SSTable {
         end: &Key,
         ts_range: Option<(i64, i64)>,
     ) -> io::Result<SSTableBatchIter> {
+        let all: Vec<usize> = (0..self.schema.columns.len()).collect();
+        self.scan_batches_projected(start, end, ts_range, &all)
+    }
+
+    pub fn scan_batches_projected(
+        &self,
+        start: &Key,
+        end: &Key,
+        ts_range: Option<(i64, i64)>,
+        user_cols: &[usize],
+    ) -> io::Result<SSTableBatchIter> {
+        let ncols = self.schema.columns.len();
+        let mut want: Vec<usize> = user_cols.to_vec();
+        for &c in &self.schema.primary_key {
+            want.push(c);
+        }
+        want.push(self.schema.time_index);
+        want.push(ncols);
+        want.push(ncols + 1);
+        want.sort_unstable();
+        want.dedup();
+        let pruned = want.len() != ncols + 2;
+
         if self.entry_count == 0 || start > end || end < &self.min_key || start > &self.max_key {
             return Ok(SSTableBatchIter::empty());
         }
@@ -660,12 +703,32 @@ impl SSTable {
         };
         let file = File::open(&self.path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let reader = builder.with_row_groups(rgs).build()?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            .with_row_groups(rgs);
+
+        if !pruned {
+            let reader = builder.build()?;
+            return Ok(SSTableBatchIter {
+                inner: Box::new(
+                    reader.map(|r| r.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))),
+                ),
+                start: start.clone(),
+                end: end.clone(),
+                ts_range,
+                full,
+                schema: self.schema.clone(),
+            });
+        }
+
+        let proj = want.clone();
+        let sst_ref = Arc::new(sst_schema(&self.schema));
+        let mask = ProjectionMask::roots(builder.parquet_schema(), want.iter().copied());
+        let reader = builder.with_projection(mask).build()?;
         Ok(SSTableBatchIter {
-            inner: Box::new(
-                reader.map(|r| r.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))),
-            ),
+            inner: Box::new(reader.map(move |r| {
+                r.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                    .and_then(|b| rebuild_full_width(b, &proj, &sst_ref))
+            })),
             start: start.clone(),
             end: end.clone(),
             ts_range,
@@ -784,6 +847,7 @@ impl Iterator for SSTableBatchIter {
 mod tests {
     use super::*;
     use crate::schema::ColumnDef;
+    use arrow::array::BinaryArray;
     use arrow_schema::DataType;
     use tempfile::tempdir;
 
@@ -1432,5 +1496,50 @@ mod tests {
                 Some((n as u64, Some(vec![n]))),
             );
         }
+    }
+
+    #[test]
+    fn test_scan_batches_projected_restores_absent_columns() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("proj.sst");
+        let schema = Arc::new(TableSchema::default_table());
+        let rows: Vec<(Key, u64, Option<Value>)> = (0..10u64)
+            .map(|i| ((vec![1], i as i64), i, Some(format!("v{i}").into_bytes())))
+            .collect();
+        let sst = SSTable::create_from_rows(&rows, 1, &path, &schema).unwrap();
+
+        let it = sst
+            .scan_batches_projected(&(vec![1], 0), &(vec![1], 9), None, &[])
+            .unwrap();
+        let mut total = 0usize;
+        for b in it {
+            let b = b.unwrap();
+            assert_eq!(b.num_columns(), schema.columns.len() + 2);
+            let f = b
+                .column(2)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .count();
+            assert_eq!(f, 0, "absent field must be all-null");
+            total += b.num_rows();
+        }
+        assert_eq!(total, 10);
+
+        let it = sst
+            .scan_batches_projected(&(vec![1], 0), &(vec![1], 9), None, &[2])
+            .unwrap();
+        let mut seen = 0usize;
+        for b in it {
+            let b = b.unwrap();
+            let f = b.column(2).as_any().downcast_ref::<BinaryArray>().unwrap();
+            for _i in 0..b.num_rows() {
+                assert!(f.iter().flatten().count() > 0);
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 10);
     }
 }

@@ -702,7 +702,7 @@ impl Region {
     }
 
     pub fn iter_all_data(&self) -> io::Result<impl Iterator<Item = (Key, Option<Value>)>> {
-        let sources = self.snapshot_columnar_sources(None)?;
+        let sources = self.snapshot_columnar_sources(None, None)?;
         let schema = Arc::new(TableSchema::clone(&self.schema));
         let mut map: BTreeMap<Key, (u64, Option<Value>)> = BTreeMap::new();
         let field_cols: Vec<usize> = schema
@@ -733,7 +733,11 @@ impl Region {
         Ok(map.into_iter().map(|(k, (_, value))| (k, value)))
     }
 
-    pub fn snapshot_columnar_sources(&self, bounds: Option<(i64, i64)>) -> io::Result<Vec<Source>> {
+    pub fn snapshot_columnar_sources(
+        &self,
+        bounds: Option<(i64, i64)>,
+        user_cols: Option<&[usize]>,
+    ) -> io::Result<Vec<Source>> {
         let v = self.version.lock().unwrap().clone();
         let mut out = Vec::new();
         if v.active.len() > 0 {
@@ -755,11 +759,13 @@ impl Region {
                 continue;
             }
             let ts_range = bounds.filter(|&(low, high)| !(low == i64::MIN && high == i64::MAX));
-            out.push(Source::Sst(sst.scan_batches(
-                sst.min_key(),
-                sst.max_key(),
-                ts_range,
-            )?));
+            let iter = match user_cols {
+                Some(cols) => {
+                    sst.scan_batches_projected(sst.min_key(), sst.max_key(), ts_range, cols)?
+                }
+                None => sst.scan_batches(sst.min_key(), sst.max_key(), ts_range)?,
+            };
+            out.push(Source::Sst(iter));
         }
 
         Ok(out)
@@ -1265,7 +1271,7 @@ mod tests {
             )?;
         }
 
-        let snapshot = region.snapshot_columnar_sources(None)?;
+        let snapshot = region.snapshot_columnar_sources(None, None)?;
         let flusher = {
             let region = region.clone();
             std::thread::spawn(move || {
@@ -1345,7 +1351,7 @@ mod tests {
         }
         region.flush()?;
 
-        let sources = region.snapshot_columnar_sources(Some((5000, 5100)))?;
+        let sources = region.snapshot_columnar_sources(Some((5000, 5100)), None)?;
         let mut rows = Vec::new();
         let schema = TableSchema::default_table();
         let field_cols: Vec<usize> = schema

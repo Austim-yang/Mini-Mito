@@ -254,7 +254,7 @@ impl<'a> BatchView<'a> {
 
     pub fn cell(&self, col: usize, i: usize) -> Option<Vec<u8>> {
         self.cols[col].cell(i)
-    } 
+    }
 
     pub fn ts_value(&self, col: usize, i: usize) -> i64 {
         match &self.cols[col] {
@@ -304,6 +304,22 @@ pub(crate) fn cells_to_array(dt: &DataType, rows: &[Option<Vec<u8>>]) -> ArrayRe
             })))
         }
         other => unimplemented!("array build for {other:?}"),
+    }
+}
+
+pub(crate) fn null_array(dt: &DataType, n: usize) -> ArrayRef {
+    match dt {
+        DataType::Binary => Arc::new(BinaryArray::from(vec![None::<&[u8]>; n])),
+        DataType::Utf8 => Arc::new(StringArray::from(vec![None::<&str>; n])),
+        DataType::Int8 => Arc::new(Int8Array::from(vec![None; n])),
+        DataType::Int64 => Arc::new(Int64Array::from(vec![None; n])),
+        DataType::Float64 => Arc::new(Float64Array::from(vec![None; n])),
+        DataType::Boolean => Arc::new(BooleanArray::from(vec![None; n])),
+        DataType::Timestamp(_, tz) => Arc::new(
+            TimestampNanosecondArray::from(vec![Option::<i64>::None; n])
+                .with_timezone_opt(tz.clone()),
+        ),
+        other => unimplemented!("null column for {other:?}"),
     }
 }
 
