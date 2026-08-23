@@ -250,7 +250,6 @@ pub struct Region {
     ttl: Arc<AtomicI64>,
     window_size: Arc<AtomicI64>,
     compact_threshold: Arc<AtomicUsize>,
-    immutable_batch_cache: Mutex<HashMap<usize, Arc<Vec<Arc<RecordBatch>>>>>,
     job_tx: SyncSender<Job>,
     worker: Mutex<Option<JoinHandle<()>>>,
     bg_error: Arc<Mutex<Option<String>>>,
@@ -290,7 +289,6 @@ impl Region {
             ttl: Arc::new(AtomicI64::new(i64::MIN)),
             window_size: Arc::new(AtomicI64::new(3_600_000_000_000)),
             compact_threshold: Arc::new(AtomicUsize::new(4)),
-            immutable_batch_cache: Mutex::new(HashMap::new()),
             job_tx,
             worker: Mutex::new(None),
             bg_error: Arc::new(Mutex::new(None)),
@@ -712,18 +710,8 @@ impl Region {
         }
 
         for imm in v.immutables.iter().rev() {
-            let ptr = Arc::as_ptr(imm) as *const () as usize;
-            let batches = {
-                let mut cache = self.immutable_batch_cache.lock().unwrap();
-                if let Some(b) = cache.get(&ptr) {
-                    b.clone()
-                } else {
-                    let b = Arc::new(imm.to_batches(&self.schema)?);
-                    cache.insert(ptr, b.clone());
-                    b
-                }
-            };
-            out.push(Source::memtable((*batches).clone()));
+            let batches = imm.to_batches(&self.schema)?;
+            out.push(Source::memtable(batches));
         }
 
         for sst in v.ssts.iter().rev() {
