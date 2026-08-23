@@ -223,18 +223,6 @@ impl<'a> ColumnView<'a> {
         }
     }
 
-    fn is_null(&self, i: usize) -> bool {
-        match self {
-            Self::Binary(a) => a.is_null(i),
-            Self::Utf8(a) => a.is_null(i),
-            Self::Int64(a) => a.is_null(i),
-            Self::Int8(a) => a.is_null(i),
-            Self::Float64(a) => a.is_null(i),
-            Self::Boolean(a) => a.is_null(i),
-            Self::Timestamp(a) => a.is_null(i),
-        }
-    }
-
     fn cell(&self, i: usize) -> Option<Vec<u8>> {
         match self {
             Self::Binary(a) => (!a.is_null(i)).then(|| a.value(i).to_vec()),
@@ -266,10 +254,6 @@ impl<'a> BatchView<'a> {
 
     pub fn cell(&self, col: usize, i: usize) -> Option<Vec<u8>> {
         self.cols[col].cell(i)
-    }
-
-    pub fn is_null(&self, col: usize, i: usize) -> bool {
-        self.cols[col].is_null(i)
     }
 
     pub fn ts_value(&self, col: usize, i: usize) -> i64 {

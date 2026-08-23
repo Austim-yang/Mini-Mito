@@ -257,11 +257,8 @@ pub(crate) fn value_at(
     if field_cols.is_empty() {
         return Some(Vec::new());
     }
-    if field_cols.iter().any(|&c| view.is_null(c, i)) {
-        return None;
-    }
     if field_cols.len() == 1 {
-        return view.cell(field_cols[0], i);
+        return Some(view.cell(field_cols[0], i).unwrap_or_default());
     }
     let mut cells = vec![Vec::new(); schema.columns.len()];
     for &c in field_cols {
