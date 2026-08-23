@@ -16,7 +16,7 @@ use crate::{
 
 const BATCH_ROWS: usize = 10_000;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct CursorKey {
     tags: Box<[u8]>,
     ts: i64,
@@ -69,34 +69,58 @@ pub struct MergeBatchIter {
     cols: Vec<TypedBuilder>,
     seqs: Int64Builder,
     ops: Int8Builder,
+    last_keys: Vec<Option<CursorKey>>,
     buffered: usize,
     primed: bool,
 }
 
-fn extract_keys(schema: &TableSchema, batch: &RecordBatch) -> Vec<CursorKey> {
+fn check_sorted(prev: &CursorKey, cur: &CursorKey, ctx: &str) -> io::Result<()> {
+    let ok = prev.tags < cur.tags || (prev.tags == cur.tags && prev.ts < cur.ts);
+    if ok {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{ctx}: {cur:?} does not follow {prev:?} (strictly increasing required)"),
+        ))
+    }
+}
+
+fn extract_keys(
+    schema: &TableSchema,
+    batch: &RecordBatch,
+    prev_tail: Option<&CursorKey>,
+    src: usize,
+) -> io::Result<Vec<CursorKey>> {
     let view = BatchView::new(batch, schema);
     let multi = schema.primary_key.len() > 1;
-    (0..batch.num_rows())
-        .map(|i| {
-            let tags: Box<[u8]> = if !multi {
-                view.cell(schema.primary_key[0], i)
-                    .unwrap_or_default()
-                    .into_boxed_slice()
-            } else {
-                let mut cells = vec![Vec::new(); schema.columns.len()];
-                for &idx in &schema.primary_key {
-                    cells[idx] = view.cell(idx, i).unwrap_or_default()
-                }
-                schema.encode_tags(&cells).into_boxed_slice()
-            };
-            CursorKey {
-                tags,
-                ts: view.ts_value(schema.time_index, i),
-                seq: view.seq_value(i) as u64,
-                op: view.op_type(i),
+    let mut out = Vec::with_capacity(batch.num_rows());
+    let mut prev = prev_tail.cloned();
+    for i in 0..batch.num_rows() {
+        let tags: Box<[u8]> = if !multi {
+            view.cell(schema.primary_key[0], i)
+                .unwrap_or_default()
+                .into_boxed_slice()
+        } else {
+            let mut cells = vec![Vec::new(); schema.columns.len()];
+            for &idx in &schema.primary_key {
+                cells[idx] = view.cell(idx, i).unwrap_or_default()
             }
-        })
-        .collect()
+            schema.encode_tags(&cells).into_boxed_slice()
+        };
+        let key = CursorKey {
+            tags,
+            ts: view.ts_value(schema.time_index, i),
+            seq: view.seq_value(i) as u64,
+            op: view.op_type(i),
+        };
+        if let Some(p) = &prev {
+            check_sorted(p, &key, &format!("source {src}"))?;
+        }
+        prev = Some(key);
+        out.push(prev.clone().unwrap());
+    }
+    Ok(out)
 }
 
 impl MergeBatchIter {
@@ -108,6 +132,7 @@ impl MergeBatchIter {
                 keys: Vec::new(),
             })
             .collect();
+        let last_keys = sources.iter().map(|_| None).collect();
         let mut m = Self {
             sources,
             cursors,
@@ -117,6 +142,7 @@ impl MergeBatchIter {
             cols: Vec::new(),
             seqs: Int64Builder::with_capacity(BATCH_ROWS),
             ops: Int8Builder::with_capacity(BATCH_ROWS),
+            last_keys,
             buffered: 0,
             primed: false,
         };
@@ -155,10 +181,12 @@ impl MergeBatchIter {
                     return Ok(false);
                 }
                 Some(batch) => {
-                    let keys = extract_keys(&self.schema, &batch);
+                    let keys =
+                        extract_keys(&self.schema, &batch, self.last_keys[src].as_ref(), src)?;
                     if keys.is_empty() {
                         continue;
                     }
+                    self.last_keys[src] = keys.last().cloned();
                     let head = keys[0].clone();
                     self.cursors[src] = SourceCursor {
                         batch: Some(batch),
@@ -273,6 +301,18 @@ mod tests {
         )])
     }
 
+    fn mem_sources_multi(
+        schema: &TableSchema,
+        batches: Vec<Vec<(Key, u64, Option<Value>)>>,
+    ) -> Source {
+        Source::memtable(
+            batches
+                .into_iter()
+                .map(|rows| Arc::new(internal_batch_from_rows(&rows, schema).unwrap()))
+                .collect(),
+        )
+    }
+
     fn merged_rows(m: MergeBatchIter, schema: &TableSchema) -> Vec<(Key, u64, i8, Option<Value>)> {
         let field_cols: Vec<usize> = schema
             .columns
@@ -346,7 +386,7 @@ mod tests {
         let mut rows = Vec::new();
         for i in 0..12_000i64 {
             rows.push((
-                (vec![i as u8], i),
+                (vec![(i >> 8) as u8, (i & 0xff) as u8], i),
                 i as u64 + 1,
                 Some(i.to_le_bytes().to_vec()),
             ));
@@ -354,7 +394,55 @@ mod tests {
         let sources = vec![mem_source(&schema, rows)];
         let got = merged_rows(MergeBatchIter::new(sources, schema.clone()), &schema);
         assert_eq!(got.len(), 12_000);
-        assert_eq!(got[0].0, (vec![0], 0));
-        assert_eq!(got[11_999].0, (vec![223], 11_999));
+        assert_eq!(got[0].0, (vec![0, 0], 0));
+        assert_eq!(got[11_999].0, (vec![46, 223], 11_999));
+    }
+
+    #[test]
+    fn test_merge_rejects_unsorted_source_across_batches() {
+        let schema = default_schema();
+        let sources = vec![mem_sources_multi(
+            &schema,
+            vec![
+                vec![((vec![2], 10), 1, Some(b"a".to_vec()))],
+                vec![((vec![1], 10), 2, Some(b"b".to_vec()))],
+            ],
+        )];
+        let result: io::Result<Vec<_>> = MergeBatchIter::new(sources, schema.clone()).collect();
+        assert!(
+            result.is_err(),
+            "unsorted source must surface as InvalidInput"
+        );
+    }
+
+    #[test]
+    fn test_merge_rejects_duplicate_key_within_one_source() {
+        let schema = default_schema();
+        let sources = vec![mem_sources_multi(
+            &schema,
+            vec![
+                vec![((vec![1], 10), 1, Some(b"a".to_vec()))],
+                vec![((vec![1], 10), 2, Some(b"b".to_vec()))],
+            ],
+        )];
+        let result: io::Result<Vec<_>> = MergeBatchIter::new(sources, schema.clone()).collect();
+        assert!(
+            result.is_err(),
+            "intra-source duplicate keys violate the contract"
+        );
+    }
+
+    #[test]
+    fn test_merge_rejects_unsorted_rows_within_batch() {
+        let schema = default_schema();
+        let sources = vec![mem_source(
+            &schema,
+            vec![
+                ((vec![2], 10), 1, Some(b"a".to_vec())),
+                ((vec![1], 10), 2, Some(b"b".to_vec())),
+            ],
+        )];
+        let result: io::Result<Vec<_>> = MergeBatchIter::new(sources, schema.clone()).collect();
+        assert!(result.is_err());
     }
 }

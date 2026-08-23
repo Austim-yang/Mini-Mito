@@ -254,7 +254,7 @@ impl<'a> BatchView<'a> {
 
     pub fn cell(&self, col: usize, i: usize) -> Option<Vec<u8>> {
         self.cols[col].cell(i)
-    }
+    } 
 
     pub fn ts_value(&self, col: usize, i: usize) -> i64 {
         match &self.cols[col] {
