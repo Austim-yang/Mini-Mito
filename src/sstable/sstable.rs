@@ -472,6 +472,7 @@ impl SSTable {
         let final_path = path.as_ref().to_path_buf();
         let tmp_path = final_path.with_extension("sst.tmp");
         let file = File::create(&tmp_path)?;
+        let sync_handle = file.try_clone()?;
         let props = WriterProperties::builder()
             .set_max_row_group_row_count(Some(CHUNK_ROWS))
             .build();
@@ -487,6 +488,7 @@ impl SSTable {
         writer
             .close()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        sync_handle.sync_all()?;
         fs::rename(&tmp_path, &final_path)?;
 
         let (min_key, max_key, entry_count) = index.bounds();
