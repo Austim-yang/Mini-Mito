@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt::Write,
     fs::{self, File},
     io,
@@ -33,6 +33,14 @@ pub(crate) const SEQ_COL: &str = "__seq";
 pub(crate) const OP_COL: &str = "__op_type";
 pub(crate) const OP_PUT: i8 = 0;
 pub(crate) const OP_DELETE: i8 = 1;
+
+#[derive(Clone, Debug)]
+struct GroupCache {
+    map: HashMap<usize, Arc<Vec<Arc<RecordBatch>>>>,
+    order: VecDeque<usize>,
+}
+
+const GROUP_CACHE_CAP: usize = 8;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RowGroupMeta {
@@ -376,7 +384,7 @@ pub struct SSTable {
     entry_count: usize,
     schema: Arc<TableSchema>,
     index: Arc<SstableIndex>,
-    row_cache: Arc<Mutex<HashMap<usize, Arc<Vec<(Key, u64, Option<Value>)>>>>>,
+    group_cache: Arc<Mutex<GroupCache>>,
 }
 
 impl SSTable {
@@ -398,7 +406,10 @@ impl SSTable {
             max_seq: index.max_seq,
             schema,
             index,
-            row_cache: Arc::new(Mutex::new(HashMap::new())),
+            group_cache: Arc::new(Mutex::new(GroupCache {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            })),
         }
     }
 
@@ -521,7 +532,10 @@ impl SSTable {
             max_seq,
             schema: Arc::new(schema.clone()),
             index: Arc::new(index),
-            row_cache: Arc::new(Mutex::new(HashMap::new())),
+            group_cache: Arc::new(Mutex::new(GroupCache {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            })),
         })
     }
 
@@ -567,41 +581,97 @@ impl SSTable {
         (rg.min_key <= *key).then_some(i)
     }
 
-    fn load_row_group(&self, rg: usize) -> io::Result<Arc<Vec<(Key, u64, Option<Value>)>>> {
-        if let Some(rows) = self.row_cache.lock().unwrap().get(&rg) {
-            return Ok(rows.clone());
+    fn find_in_row_group(&self, rg: usize, key: &Key) -> io::Result<Option<(u64, Option<Value>)>> {
+        {
+            let cache = self.group_cache.lock().unwrap();
+            if let Some(batches) = cache.map.get(&rg) {
+                return Ok(Self::search_batches(batches, &self.schema, key));
+            }
         }
 
+        let batches = self.decode_row_group(rg)?;
+        let mut cache = self.group_cache.lock().unwrap();
+        if cache.order.len() >= GROUP_CACHE_CAP && !cache.map.contains_key(&rg) {
+            if let Some(evict) = cache.order.pop_front() {
+                cache.map.remove(&evict);
+            }
+        }
+        if !cache.map.contains_key(&rg) {
+            cache.order.push_back(rg);
+        }
+        cache.map.insert(rg, batches.clone());
+        Ok(Self::search_batches(&batches, &self.schema, key))
+    }
+
+    fn decode_row_group(&self, rg: usize) -> io::Result<Arc<Vec<Arc<RecordBatch>>>> {
         let file = File::open(&self.path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let reader = builder.with_row_groups(vec![rg]).build()?;
+        let ncols = self.schema.columns.len();
+        let mut want: Vec<usize> = self.schema.primary_key.clone();
+        want.push(self.schema.time_index);
+        for (i, c) in self.schema.columns.iter().enumerate() {
+            if c.semantic == SemanticType::Field {
+                want.push(i);
+            }
+        }
+        want.push(ncols);
+        want.push(ncols + 1);
+        want.sort_unstable();
+        want.dedup();
 
-        let field_cols: Vec<usize> = self
-            .schema
+        let mask = ProjectionMask::roots(builder.parquet_schema(), want.iter().copied());
+        let reader = builder
+            .with_row_groups(vec![rg])
+            .with_projection(mask)
+            .build()?;
+        let sst_ref: Arc<arrow::datatypes::Schema> = Arc::new(sst_schema(&self.schema));
+        let batches: Vec<Arc<RecordBatch>> = reader
+            .map(|r| {
+                r.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                    .and_then(|b| rebuild_full_width(b, &want, &sst_ref))
+                    .map(Arc::new)
+            })
+            .collect::<io::Result<_>>()?;
+        Ok(Arc::new(batches))
+    }
+
+    fn search_batches(
+        batches: &[Arc<RecordBatch>],
+        schema: &Arc<TableSchema>,
+        key: &Key,
+    ) -> Option<(u64, Option<Value>)> {
+        let field_cols: Vec<usize> = schema
             .columns
             .iter()
             .enumerate()
             .filter(|(_, c)| c.semantic == SemanticType::Field)
             .map(|(c, _)| c)
             .collect();
-
-        let mut rows = Vec::new();
-        for batch_result in reader {
-            let batch = batch_result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let view = BatchView::new(&batch, &self.schema);
-            for i in 0..batch.num_rows() {
-                rows.push((
-                    key_at(&view, &self.schema, i),
-                    view.seq_value(i) as u64,
-                    value_at(&view, &self.schema, &field_cols, i),
-                ));
+        for batch in batches {
+            let view = BatchView::new(batch, schema);
+            let mut lo = 0usize;
+            let mut hi = batch.num_rows();
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if key_at(&view, schema, mid) < *key {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
             }
+            if lo == batch.num_rows() {
+                continue;
+            }
+            if key_at(&view, schema, lo) != *key {
+                return None;
+            }
+            return Some((
+                view.seq_value(lo) as u64,
+                value_at(&view, schema, &field_cols, lo),
+            ));
         }
-
-        let rows = Arc::new(rows);
-        self.row_cache.lock().unwrap().insert(rg, rows.clone());
-        Ok(rows)
+        None
     }
 
     pub fn get(&self, key: &Key) -> io::Result<Option<(u64, Option<Value>)>> {
@@ -617,17 +687,7 @@ impl SSTable {
             return Ok(None);
         };
 
-        let rows = self.load_row_group(rg)?;
-        for (k, seq, value) in rows.iter() {
-            if k > key {
-                break;
-            }
-            if k == key {
-                return Ok(Some((*seq, value.clone())));
-            }
-        }
-
-        Ok(None)
+        self.find_in_row_group(rg, key)
     }
 
     fn select_row_groups(
@@ -1541,5 +1601,26 @@ mod tests {
             }
         }
         assert_eq!(seen, 10);
+    }
+
+    #[test]
+    fn test_get_miss_within_range_returns_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("miss.sst");
+        let schema = Arc::new(TableSchema::default_table());
+        let rows: Vec<(Key, u64, Option<Value>)> = vec![
+            ((vec![1], 0), 1, Some(b"a".to_vec())),
+            ((vec![3], 0), 2, Some(b"c".to_vec())),
+        ];
+        let sst = SSTable::create_from_rows(&rows, 1, &path, &schema).unwrap();
+        assert_eq!(sst.get(&(vec![2], 0)).unwrap(), None);
+        assert_eq!(
+            sst.get(&(vec![1], 0)).unwrap(),
+            Some((1, Some(b"a".to_vec())))
+        );
+        assert_eq!(
+            sst.get(&(vec![3], 0)).unwrap(),
+            Some((2, Some(b"c".to_vec())))
+        );
     }
 }
