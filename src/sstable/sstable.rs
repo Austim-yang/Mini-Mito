@@ -382,6 +382,7 @@ impl SSTable {
         }
     }
 
+    /// every batches but be strictly increasing, intra-batch line order ascending, inter-batch keyless interleaving
     pub fn create_from_batches(
         batches: &[Arc<RecordBatch>],
         id: usize,
@@ -396,9 +397,7 @@ impl SSTable {
                 (key_at(&view, schema, 0), (*b).clone())
             })
             .collect();
-        if keyed.windows(2).any(|w| w[0].0 > w[1].0) {
-            keyed.sort_by(|a, b| a.0.cmp(&b.0));
-        }
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
         let ordered: Vec<Arc<RecordBatch>> = keyed.into_iter().map(|(_, b)| b).collect();
         let seed = rand::random::<u64>();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -411,11 +410,24 @@ impl SSTable {
         let mut chunk_max: Option<Key> = None;
         let mut chunk_min_ts: Option<i64> = None;
         let mut chunk_max_ts: Option<i64> = None;
+        let mut last_key: Option<Key> = None;
 
         for batch in &ordered {
             let view = BatchView::new(batch, schema);
             for i in 0..batch.num_rows() {
                 let key = key_at(&view, schema, i);
+                if let Some(prev) = &last_key {
+                    if prev >= &key {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "input batches are not globally key-sorted \
+                                 (strictly increasing required): {key:?} follows {prev:?}"
+                            ),
+                        ));
+                    }
+                }
+                last_key = Some(key.clone());
 
                 max_seq = max_seq.max(view.seq_value(i) as u64);
                 bloom.insert(&key);
@@ -1372,5 +1384,51 @@ mod tests {
         );
         assert!(got.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn test_create_from_batches_rejects_overlapping_batch_ranges() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("overlap.sst");
+        let schema = TableSchema::default_table();
+
+        let b1 = internal_batch_from_rows(
+            &[
+                ((vec![1u8], 0), 1, Some(vec![11u8])),
+                ((vec![3u8], 0), 3, Some(vec![33u8])),
+            ],
+            &schema,
+        )
+        .unwrap();
+        let b2 =
+            internal_batch_from_rows(&[((vec![2u8], 0), 2, Some(vec![22u8]))], &schema).unwrap();
+
+        let result = SSTable::create_from_batches(&[Arc::new(b1), Arc::new(b2)], 1, &path, &schema);
+        assert!(
+            result.is_err(),
+            "overlapping batch ranges must be rejected, not silently written"
+        );
+    }
+
+    #[test]
+    fn test_create_from_batches_sorts_disjoint_unordered_input() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("reorder.sst");
+        let schema = TableSchema::default_table();
+
+        let mk = |n: u8, seq: u64| {
+            Arc::new(
+                internal_batch_from_rows(&[((vec![n], 0), seq, Some(vec![n]))], &schema).unwrap(),
+            ) as Arc<RecordBatch>
+        };
+        let sst = SSTable::create_from_batches(&[mk(3, 3), mk(1, 1), mk(2, 2)], 1, &path, &schema)
+            .expect("disjoint unordered batches are valid");
+
+        for n in [1u8, 2, 3] {
+            assert_eq!(
+                sst.get(&(vec![n], 0)).unwrap(),
+                Some((n as u64, Some(vec![n]))),
+            );
+        }
     }
 }
