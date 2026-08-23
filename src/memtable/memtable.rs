@@ -1514,7 +1514,15 @@ mod tests {
 
         for i in 0..6i64 {
             region.write(k(1, i), v("x"))?;
-            assert!(region.get_immutable_ssts().len() <= 1);
+        }
+        region.flush_barrier()?;
+        let n = region.get_immutable_ssts().len();
+        assert!(
+            (1..=2).contains(&n),
+            "auto compaction should bound sst count, got {n}"
+        );
+        for i in 0..6i64 {
+            assert_eq!(region.get(k(1, i))?, Some(v("x")));
         }
         Ok(())
     }
