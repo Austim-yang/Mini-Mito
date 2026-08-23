@@ -55,6 +55,7 @@ struct WorkerState {
     ttl: Arc<AtomicI64>,
     compact_threshold: Arc<AtomicUsize>,
     error: Arc<Mutex<Option<String>>>,
+    pending_deletes: Mutex<Vec<PathBuf>>,
 }
 
 impl WorkerState {
@@ -92,7 +93,7 @@ impl WorkerState {
             });
         }
         write_manifest(&self.version, &self.manifest_path)?;
-        let _ = fs::remove_file(imm.wal_path());
+        deferred_remove(imm.wal_path(), &self.pending_deletes);
         Ok(())
     }
 
@@ -179,7 +180,7 @@ impl WorkerState {
         }
         write_manifest(&self.version, &self.manifest_path)?;
         for p in old_paths {
-            let _ = fs::remove_file(p);
+            deferred_remove(&p, &self.pending_deletes);
         }
         Ok(())
     }
@@ -187,6 +188,7 @@ impl WorkerState {
 
 fn worker_loop(rx: Receiver<Job>, st: Arc<WorkerState>) {
     while let Ok(job) = rx.recv() {
+        retry_pending_deletes(&st.pending_deletes);
         match job {
             Job::Flush(imm) => {
                 if let Err(e) = st.flush_one(&imm) {
@@ -235,6 +237,24 @@ fn write_manifest(version: &Mutex<Arc<Version>>, manifest_path: &Path) -> io::Re
     writer.get_ref().sync_all()?;
     fs::rename(&tmp_path, manifest_path)?;
     Ok(())
+}
+
+fn deferred_remove(path: &Path, pending: &Mutex<Vec<PathBuf>>) {
+    if let Err(e) = fs::remove_file(path) {
+        eprintln!("mito: deferring delete of {}: {e}", path.display());
+        pending.lock().unwrap().push(path.to_path_buf());
+    }
+}
+
+fn retry_pending_deletes(pending: &Mutex<Vec<PathBuf>>) {
+    let mut list = pending.lock().unwrap();
+    if list.is_empty() {
+        return;
+    }
+    list.retain(|p| match fs::remove_file(p) {
+        Ok(()) => false,
+        Err(_) => true,
+    });
 }
 
 pub struct Region {
@@ -303,6 +323,7 @@ impl Region {
             ttl: region.ttl.clone(),
             compact_threshold: region.compact_threshold.clone(),
             error: region.bg_error.clone(),
+            pending_deletes: Mutex::new(Vec::new()),
         });
         let handle = std::thread::Builder::new()
             .name("mini-mito-flusher".into())
@@ -378,7 +399,9 @@ impl Region {
                 }
             })?;
             if latest.is_empty() {
-                let _ = fs::remove_file(path);
+                if let Err(e) = fs::remove_file(path) {
+                    eprintln!("orphan wal cleanup failed {}: {e}", path.display());
+                }
                 continue;
             }
             for (key, (seq, value)) in latest {
@@ -389,7 +412,9 @@ impl Region {
                     }
                 }
             }
-            let _ = fs::remove_file(path);
+            if let Err(e) = fs::remove_file(path) {
+                eprintln!("orphan wal cleanup failed {}: {e}", path.display());
+            }
         }
         Ok(())
     }
@@ -415,23 +440,30 @@ impl Region {
                 .unwrap_or(usize::MAX)
         });
 
+        let max_manifest_id = ssts.iter().map(|s| s.id()).max();
         let mut added = 0;
         for path in files {
             if existing.contains(&path) {
                 continue;
             }
-            let is_numeric = path
+            let Some(id) = path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .map(|s| s.parse::<usize>().is_ok())
-                .unwrap_or(false);
-            if !is_numeric {
+                .and_then(|s| s.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            if max_manifest_id.is_some_and(|max| id <= max) {
+                eprintln!(
+                    "ignoring stale untracked sst {} (id <= manifest max)",
+                    path.display()
+                );
                 continue;
             }
             let sst = SSTable::open_from_path(&path, &self.schema)?;
             let current = self.sst_id.load(Ordering::SeqCst);
-            if sst.id() >= current {
-                self.sst_id.store(sst.id() + 1, Ordering::SeqCst);
+            if id >= current {
+                self.sst_id.store(id + 1, Ordering::SeqCst);
             }
             ssts.push(sst);
             added += 1;
@@ -1079,6 +1111,7 @@ mod tests {
         for ((host, cpu, ts), value, note) in rows.clone() {
             region.write(mkkey(&schema, host, cpu, ts), mkval(&schema, value, note))?;
         }
+        region.flush()?;
         assert_eq!(region.get_immutable_ssts().len(), 1);
 
         region.compact()?;
@@ -1508,6 +1541,69 @@ mod tests {
         let region = Region::new(&wal_path)?;
         assert_eq!(region.get(k(1, expired))?, None);
         assert_eq!(region.get(k(2, fresh))?, Some(v("new")));
+        Ok(())
+    }
+
+    fn find_sst_file(dir: &Path) -> Option<PathBuf> {
+        fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().map_or(false, |x| x == "sst"))
+    }
+
+    #[test]
+    fn test_recovery_does_not_resurrect_stale_sst() -> io::Result<()> {
+        let dir = tempdir()?;
+        let wal = dir.path().join("wal.log");
+        let schema = Arc::new(TableSchema::default_table());
+        {
+            let region = Region::with_schema(&wal, schema.clone())?;
+            region.write(k(1, 1), v("a"))?;
+            region.flush()?;
+            assert_eq!(region.get_immutable_ssts().len(), 1);
+            region.close()?;
+        }
+        let src = find_sst_file(dir.path()).expect("flushed sst should exist");
+        fs::copy(&src, dir.path().join("0099.sst"))?;
+
+        let manifest = dir.path().join("manifest");
+        let first_line = fs::read_to_string(&manifest)?
+            .lines()
+            .next()
+            .expect("manifest should have exactly one entry")
+            .to_string();
+        let mut entry: serde_json::Value = serde_json::from_str(&first_line)?;
+        entry["id"] = serde_json::json!(99usize);
+        entry["path"] = serde_json::json!("0099.sst");
+        fs::write(&manifest, serde_json::to_string(&entry)? + "\n")?;
+
+        let region = Region::with_schema(&wal, schema)?;
+        assert_eq!(region.get_immutable_ssts().len(), 1);
+        assert_eq!(region.len(), 1);
+        region.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_recovery_adopts_untracked_high_id_sst() -> io::Result<()> {
+        let dir = tempdir()?;
+        let wal = dir.path().join("wal.log");
+        let schema = Arc::new(TableSchema::default_table());
+        {
+            let region = Region::with_schema(&wal, schema.clone())?;
+            region.write(k(1, 1), v("a"))?;
+            region.flush()?;
+            region.close()?;
+        }
+
+        let src = find_sst_file(dir.path()).expect("flushed sst should exist");
+        fs::copy(&src, dir.path().join("0042.sst"))?;
+
+        let region = Region::with_schema(&wal, schema)?;
+        assert_eq!(region.get_immutable_ssts().len(), 2);
+        assert_eq!(region.len(), 2);
+        region.close()?;
         Ok(())
     }
 }
