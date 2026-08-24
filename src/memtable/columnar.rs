@@ -13,7 +13,10 @@ use arrow::array::{ArrayRef, BinaryArray, Int8Array, Int64Array, RecordBatch};
 use arrow_schema::DataType;
 
 use crate::{
-    Key, Value, memtable::{ImmutableMemtable, Memtable, Wal, wal::Operation}, schema::{BatchView, SemanticType, TableSchema}, sstable::sstable::{OP_DELETE, OP_PUT, internal_batch_from_rows, key_at, sst_schema},
+    Key, Value,
+    memtable::{ImmutableMemtable, Memtable, Wal, wal::Operation},
+    schema::{BatchView, SemanticType, TableSchema},
+    sstable::sstable::{OP_DELETE, OP_PUT, internal_batch_from_rows, key_at, sst_schema},
 };
 
 const DEFAULT_SHARDS: usize = 16;
@@ -435,9 +438,14 @@ mod tests {
         Arc::new(TableSchema::default_table())
     }
     fn fresh(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         let dir = env::temp_dir()
-            .join(format!("mini_mito_col_{}", std::process::id()))
+            .join(format!("mini_mito_col_{}_{}", std::process::id(), nanos))
             .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         dir.join("wal_000.log")
     }
