@@ -17,8 +17,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     memtable::{
-        Wal, columnar::ColumnarMemtable, traits::{ImmutableMemtable, Memtable}, transaction::{Transaction, TxError}, version::{Source, Version}, wal::Operation,
-    }, query::merge::MergeBatchIter, schema::{BatchView, SemanticType, TableSchema}, sstable::sstable::{SSTable, SstableIndex, key_at, value_at}, types::{Key, Value},
+        Wal,
+        columnar::ColumnarMemtable,
+        traits::{ImmutableMemtable, Memtable},
+        transaction::{Transaction, TxError},
+        version::{Source, Version},
+        wal::Operation,
+    },
+    query::merge::MergeBatchIter,
+    schema::{BatchView, SemanticType, TableSchema},
+    sstable::sstable::{SSTable, SstableIndex, key_at, value_at},
+    types::{Key, Value},
 };
 
 #[derive(Serialize, Deserialize)]
@@ -181,7 +190,10 @@ impl WorkerState {
 fn worker_loop(rx: Receiver<Job>, st: Arc<WorkerState>) {
     while let Ok(job) = rx.recv() {
         retry_pending_deletes(&st.pending_deletes);
-        match job {
+        if matches!(job, Job::Shutdown) {
+            break;
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job {
             Job::Flush(imm) => {
                 if let Err(e) = st.flush_one(&imm) {
                     st.record_error(e);
@@ -197,7 +209,18 @@ fn worker_loop(rx: Receiver<Job>, st: Arc<WorkerState>) {
             Job::Sync(tx) => {
                 let _ = tx.send(());
             }
-            Job::Shutdown => break,
+            Job::Shutdown => {}
+        }));
+        if let Err(payload) = outcome {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            st.record_error(io::Error::new(
+                io::ErrorKind::Other,
+                format!("worker panicked: {msg}"),
+            ));
         }
     }
 }
@@ -247,6 +270,20 @@ fn retry_pending_deletes(pending: &Mutex<Vec<PathBuf>>) {
         Ok(()) => false,
         Err(_) => true,
     });
+}
+
+fn sweep_tmp_files(base_dir: &Path) {
+    let Ok(entries) = fs::read_dir(base_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "tmp")
+            && let Err(e) = fs::remove_file(&path)
+        {
+            eprintln!("stale tmp cleanup failed {}: {e}", path.display());
+        }
+    }
 }
 
 pub struct Region {
@@ -364,6 +401,7 @@ impl Region {
         if !region.manifest_path.exists() || found > 0 {
             region.write_manifest()?;
         }
+        sweep_tmp_files(&region.base_dir);
         Ok(region)
     }
 
@@ -574,7 +612,9 @@ impl Region {
             }
         }
 
-        let start = self.seq.fetch_add(txn.writes.len() as u64, Ordering::SeqCst);
+        let start = self
+            .seq
+            .fetch_add(txn.writes.len() as u64, Ordering::SeqCst);
         let entries: Vec<(Key, u64, Option<Value>)> = txn
             .writes
             .iter()
@@ -907,6 +947,9 @@ impl Drop for Region {
         let _ = self.flush_barrier();
         self.shutdown_worker();
         let _ = self.check_bg_error();
+        if let Ok(v) = self.version.lock() {
+            let _ = v.active.close();
+        }
     }
 }
 
@@ -1688,5 +1731,36 @@ mod tests {
         assert_eq!(region.len(), 2);
         region.close()?;
         Ok(())
+    }
+
+    #[test]
+    fn test_drop_without_flush_recovers_from_wal() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        {
+            let region = Region::new(&wal_path).unwrap();
+            region.write(k(1, 10), v("a")).unwrap();
+            region.write(k(2, 20), v("b")).unwrap();
+            region.delete(k(1, 10)).unwrap();
+        }
+
+        let reopened = Region::new(&wal_path).unwrap();
+        assert_eq!(reopened.get(k(1, 10)).unwrap(), None);
+        assert_eq!(reopened.get(k(2, 20)).unwrap(), Some(v("b")));
+        reopened.write(k(3, 30), v("c")).unwrap();
+        assert_eq!(reopened.get(k(3, 30)).unwrap(), Some(v("c")));
+    }
+
+    #[test]
+    fn test_open_sweeps_stale_tmp_files() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+        std::fs::write(dir.path().join("0003.sst.tmp"), b"garbage").unwrap();
+        std::fs::write(dir.path().join("manifest.tmp"), b"garbage").unwrap();
+
+        Region::new(&wal_path).unwrap();
+
+        assert!(!dir.path().join("0003.sst.tmp").exists());
+        assert!(!dir.path().join("manifest.tmp").exists());
     }
 }
