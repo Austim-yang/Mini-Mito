@@ -74,14 +74,16 @@ pub struct MergeBatchIter {
     primed: bool,
 }
 
-fn check_sorted(prev: &CursorKey, cur: &CursorKey, ctx: &str) -> io::Result<()> {
+fn check_sorted(prev: &CursorKey, cur: &CursorKey, src: usize) -> io::Result<()> {
     let ok = prev.tags < cur.tags || (prev.tags == cur.tags && prev.ts < cur.ts);
     if ok {
         Ok(())
     } else {
         Err(io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("{ctx}: {cur:?} does not follow {prev:?} (strictly increasing required)"),
+            format!(
+                "source {src}: {cur:?} does not follow {prev:?} (strictly increasing required)"
+            ),
         ))
     }
 }
@@ -115,7 +117,7 @@ fn extract_keys(
             op: view.op_type(i),
         };
         if let Some(p) = &prev {
-            check_sorted(p, &key, &format!("source {src}"))?;
+            check_sorted(p, &key, src)?;
         }
         prev = Some(key);
         out.push(prev.clone().unwrap());

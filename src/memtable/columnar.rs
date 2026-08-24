@@ -9,13 +9,11 @@ use std::{
     },
 };
 
-use arrow::array::RecordBatch;
+use arrow::array::{ArrayRef, BinaryArray, Int8Array, Int64Array, RecordBatch};
+use arrow_schema::DataType;
 
 use crate::{
-    Key, Value,
-    memtable::{ImmutableMemtable, Memtable, Wal, wal::Operation},
-    schema::{BatchView, TableSchema},
-    sstable::sstable::{internal_batch_from_rows, key_at},
+    Key, Value, memtable::{ImmutableMemtable, Memtable, Wal, wal::Operation}, schema::{BatchView, SemanticType, TableSchema}, sstable::sstable::{OP_DELETE, OP_PUT, internal_batch_from_rows, key_at, sst_schema},
 };
 
 const DEFAULT_SHARDS: usize = 16;
@@ -23,7 +21,7 @@ const ROW_FIXED_BYTES: usize = 17;
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
-type SeriesRows = Vec<(i64, u64, Option<Value>)>;
+type SeriesRows = Vec<(i64, u64, Option<Arc<Value>>)>;
 
 struct Shard {
     series: HashMap<Box<[u8]>, SeriesRows>,
@@ -39,7 +37,7 @@ fn series_hash(tags: &[u8]) -> u64 {
 }
 
 fn find_old(rows: &SeriesRows, ts: i64) -> Option<Value> {
-    let mut best: Option<(u64, Option<Value>)> = None;
+    let mut best: Option<(u64, Option<Arc<Value>>)> = None;
     for &(row_ts, row_seq, ref v) in rows {
         if row_ts == ts {
             match &best {
@@ -48,7 +46,7 @@ fn find_old(rows: &SeriesRows, ts: i64) -> Option<Value> {
             }
         }
     }
-    best.and_then(|(_, v)| v)
+    best.and_then(|(_, v)| v.map(|a| a.as_ref().clone()))
 }
 
 fn materialize_series(
@@ -62,18 +60,78 @@ fn materialize_series(
         row_a.0.cmp(&row_b.0).then(row_b.1.cmp(&row_a.1))
     });
     let mut last_ts: Option<i64> = None;
-    let sorted: Vec<(Key, u64, Option<Value>)> = idx
+    let kept: Vec<u32> = idx
         .into_iter()
-        .filter_map(|i| {
-            let (ts, seq, v) = &rows[i as usize];
-            if last_ts == Some(*ts) {
-                return None;
+        .filter(|&i| {
+            let ts = rows[i as usize].0;
+            let keep = last_ts != Some(ts);
+            if keep {
+                last_ts = Some(ts);
             }
-            last_ts = Some(*ts);
-            Some(((tags.to_vec(), *ts), *seq, v.clone()))
+            keep
         })
         .collect();
-    internal_batch_from_rows(&sorted, schema)
+
+    let nfields = schema
+        .columns
+        .iter()
+        .filter(|c| c.semantic == SemanticType::Field)
+        .count();
+    let field_pos = schema
+        .columns
+        .iter()
+        .position(|c| c.semantic == SemanticType::Field);
+    let fast = schema.primary_key.len() == 1
+        && nfields == 1
+        && schema.columns.len() == 3
+        && schema.columns[schema.primary_key[0]].data_type == DataType::Binary
+        && schema.columns[field_pos.unwrap()].data_type == DataType::Binary;
+
+    if !fast {
+        let sorted: Vec<(Key, u64, Option<Value>)> = kept
+            .iter()
+            .map(|&i| {
+                let (ts, seq, v) = &rows[i as usize];
+                (
+                    (tags.to_vec(), *ts),
+                    *seq,
+                    v.as_ref().map(|a| a.as_ref().clone()),
+                )
+            })
+            .collect();
+        return internal_batch_from_rows(&sorted, schema);
+    }
+
+    let pk = schema.primary_key[0];
+    let fi = field_pos.unwrap();
+    let mut slots: Vec<Option<ArrayRef>> = (0..schema.columns.len()).map(|_| None).collect();
+    slots[pk] = Some(Arc::new(BinaryArray::from_iter_values(
+        std::iter::repeat(tags).take(kept.len()),
+    )));
+    slots[schema.time_index] = Some(Arc::new(Int64Array::from_iter(
+        kept.iter().map(|&i| Some(rows[i as usize].0)),
+    )));
+    slots[fi] =
+        Some(Arc::new(BinaryArray::from_iter(kept.iter().map(|&i| {
+            rows[i as usize].2.as_ref().map(|a| a.as_slice())
+        }))));
+
+    let mut arrays: Vec<ArrayRef> = slots
+        .into_iter()
+        .map(|s| s.expect("all user columns populated"))
+        .collect();
+    arrays.push(Arc::new(Int64Array::from_iter(
+        kept.iter().map(|&i| Some(rows[i as usize].1 as i64)),
+    )));
+    arrays.push(Arc::new(Int8Array::from_iter(kept.iter().map(|&i| {
+        if rows[i as usize].2.is_some() {
+            OP_PUT
+        } else {
+            OP_DELETE
+        }
+    }))));
+    RecordBatch::try_new(Arc::new(sst_schema(schema)), arrays)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 pub struct ColumnarMemtable {
@@ -143,12 +201,13 @@ impl ColumnarMemtable {
         seq: u64,
         value: Option<Value>,
     ) -> Option<Value> {
-        let bytes = ROW_FIXED_BYTES + value.as_ref().map_or(0, |v| v.len());
+        let stored = value.map(Arc::new);
+        let bytes = ROW_FIXED_BYTES + stored.as_ref().map_or(0, |v| v.len());
         let old = {
             let mut shard = self.shard_for(&tags).lock().unwrap();
             let rows = shard.series.entry(tags).or_default();
             let old = find_old(rows, ts);
-            rows.push((ts, seq, value));
+            rows.push((ts, seq, stored));
             old
         };
         self.row_count.fetch_add(1, Ordering::Relaxed);
@@ -158,7 +217,7 @@ impl ColumnarMemtable {
     }
 
     fn scan_series(rows: &SeriesRows, ts: i64) -> Option<(u64, Option<Value>)> {
-        let mut best: Option<(u64, Option<Value>)> = None;
+        let mut best: Option<(u64, Option<Arc<Value>>)> = None;
         for &(row_ts, seq, ref v) in rows {
             if row_ts == ts {
                 match &best {
@@ -167,7 +226,7 @@ impl ColumnarMemtable {
                 }
             }
         }
-        best
+        best.map(|(s, v)| (s, v.map(|a| a.as_ref().clone())))
     }
 }
 
