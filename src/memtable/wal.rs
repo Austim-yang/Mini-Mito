@@ -71,6 +71,8 @@ impl Wal {
         let mut frame = Vec::with_capacity(ops.len() * 32);
         encode_ops(ops, &mut frame);
         self.writer.write_all(&(frame.len() as u32).to_le_bytes())?;
+        self.writer
+            .write_all(&crc32fast::hash(&frame).to_le_bytes())?;
         self.writer.write_all(&frame)?;
         self.maybe_sync(ops.len() as u32)
     }
@@ -108,8 +110,15 @@ impl Wal {
             if frame_len == 0 || frame_len > MAX_FRAME_LEN {
                 return Ok(());
             }
+            let mut crc_buf = [0u8; 4];
+            if reader.read_exact(&mut crc_buf).is_err() {
+                return Ok(());
+            }
             let mut frame = vec![0u8; frame_len];
             if reader.read_exact(&mut frame).is_err() {
+                return Ok(());
+            }
+            if crc32fast::hash(&frame) != u32::from_le_bytes(crc_buf) {
                 return Ok(());
             }
             for op in decode_ops(&frame) {
@@ -457,8 +466,12 @@ mod tests {
                 .open(&path)
                 .unwrap();
             file.write_all(&(frame.len() as u32).to_le_bytes()).unwrap();
+            file.write_all(&crc32fast::hash(&frame).to_le_bytes())
+                .unwrap();
             file.write_all(&frame).unwrap();
             file.write_all(&(frame.len() as u32).to_le_bytes()).unwrap();
+            file.write_all(&crc32fast::hash(&frame).to_le_bytes())
+                .unwrap();
             file.write_all(&frame[..frame.len() / 2]).unwrap();
         }
 
@@ -523,5 +536,87 @@ mod tests {
             })
             .unwrap();
         always.close().unwrap();
+    }
+
+    fn frame_payload_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos + 8 <= bytes.len() {
+            let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            if len == 0 || pos + 8 + len > bytes.len() {
+                break;
+            }
+            out.push((pos + 8, len));
+            pos += 8 + len;
+        }
+        out
+    }
+
+    #[test]
+    fn test_wal_bit_flip_in_payload_detected_by_crc() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("crc_payload.log");
+        {
+            let mut wal = Wal::new(&path).unwrap();
+            wal.append(&Operation::Insert {
+                key: k(1, 0),
+                seq: 1,
+                value: v("a"),
+            })
+            .unwrap();
+            wal.append(&Operation::Insert {
+                key: k(2, 0),
+                seq: 2,
+                value: v("b"),
+            })
+            .unwrap();
+            wal.close().unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        let ranges = frame_payload_ranges(&bytes);
+        assert_eq!(ranges.len(), 2);
+        let (start, len) = ranges[1];
+        bytes[start + len - 1] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let wal = Wal::new(&path).unwrap();
+        let mut rows = Rows::default();
+        wal.recover(&mut replay_into(&mut rows)).unwrap();
+        assert_eq!(rows.get(&k(1, 0)), Some((1, Some(v("a")))));
+        assert_eq!(rows.get(&k(2, 0)), None, "corrupted frame must be dropped");
+    }
+
+    #[test]
+    fn test_wal_crc_field_flip_detected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("crc_field.log");
+        {
+            let mut wal = Wal::new(&path).unwrap();
+            wal.append(&Operation::Insert {
+                key: k(1, 0),
+                seq: 1,
+                value: v("a"),
+            })
+            .unwrap();
+            wal.append(&Operation::Insert {
+                key: k(2, 0),
+                seq: 2,
+                value: v("b"),
+            })
+            .unwrap();
+            wal.close().unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        let ranges = frame_payload_ranges(&bytes);
+        assert_eq!(ranges.len(), 2);
+        let (start, _) = ranges[1];
+        bytes[start - 4] ^= 0x80;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let wal = Wal::new(&path).unwrap();
+        let mut rows = Rows::default();
+        wal.recover(&mut replay_into(&mut rows)).unwrap();
+        assert_eq!(rows.get(&k(1, 0)), Some((1, Some(v("a")))));
+        assert_eq!(rows.get(&k(2, 0)), None);
     }
 }
