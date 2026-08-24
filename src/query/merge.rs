@@ -18,7 +18,7 @@ const BATCH_ROWS: usize = 10_000;
 
 #[derive(Clone, Debug)]
 struct CursorKey {
-    tags: Box<[u8]>,
+    tags: Arc<[u8]>,
     ts: i64,
     seq: u64,
     op: i8,
@@ -97,18 +97,23 @@ fn extract_keys(
     let view = BatchView::new(batch, schema);
     let multi = schema.primary_key.len() > 1;
     let mut out = Vec::with_capacity(batch.num_rows());
-    let mut prev = prev_tail.cloned();
+    let mut last_tags: Option<Arc<[u8]>> = prev_tail.map(|k| Arc::clone(&k.tags));
     for i in 0..batch.num_rows() {
-        let tags: Box<[u8]> = if !multi {
-            view.cell(schema.primary_key[0], i)
-                .unwrap_or_default()
-                .into_boxed_slice()
+        let tags: Arc<[u8]> = if !multi {
+            let bytes: Option<&[u8]> = view.cell_slice(schema.primary_key[0], i);
+            match bytes {
+                Some(bytes) => intern_tags(&mut last_tags, bytes),
+                None => {
+                    let cell = view.cell(schema.primary_key[0], i).unwrap_or_default();
+                    intern_tags(&mut last_tags, &cell)
+                }
+            }
         } else {
             let mut cells = vec![Vec::new(); schema.columns.len()];
             for &idx in &schema.primary_key {
-                cells[idx] = view.cell(idx, i).unwrap_or_default()
+                cells[idx] = view.cell(idx, i).unwrap_or_default();
             }
-            schema.encode_tags(&cells).into_boxed_slice()
+            Arc::from(schema.encode_tags(&cells).into_boxed_slice())
         };
         let key = CursorKey {
             tags,
@@ -116,13 +121,23 @@ fn extract_keys(
             seq: view.seq_value(i) as u64,
             op: view.op_type(i),
         };
-        if let Some(p) = &prev {
+        if let Some(p) = out.last() {
             check_sorted(p, &key, src)?;
+        } else if let Some(tail) = prev_tail {
+            check_sorted(tail, &key, src)?;
         }
-        prev = Some(key);
-        out.push(prev.clone().unwrap());
+        out.push(key);
     }
     Ok(out)
+}
+
+fn intern_tags(last_tags: &mut Option<Arc<[u8]>>, bytes: &[u8]) -> Arc<[u8]> {
+    if last_tags.as_deref() == Some(bytes) {
+        return last_tags.clone().unwrap();
+    }
+    let arc = Arc::from(bytes);
+    *last_tags = Some(Arc::clone(&arc));
+    arc
 }
 
 impl MergeBatchIter {

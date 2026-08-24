@@ -234,6 +234,14 @@ impl<'a> ColumnView<'a> {
             Self::Timestamp(a) => (!a.is_null(i)).then(|| a.value(i).to_le_bytes().to_vec()),
         }
     }
+
+    fn cell_slice(&self, i: usize) -> Option<&'a [u8]> {
+        match self {
+            Self::Binary(a) => (!a.is_null(i)).then(|| a.value(i)),
+            Self::Utf8(a) => (!a.is_null(i)).then(|| a.value(i).as_bytes()),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) struct BatchView<'a> {
@@ -254,6 +262,10 @@ impl<'a> BatchView<'a> {
 
     pub fn cell(&self, col: usize, i: usize) -> Option<Vec<u8>> {
         self.cols[col].cell(i)
+    }
+
+     pub fn cell_slice(&self, col: usize, i: usize) -> Option<&'a [u8]> {
+        self.cols[col].cell_slice(i)
     }
 
     pub fn ts_value(&self, col: usize, i: usize) -> i64 {
