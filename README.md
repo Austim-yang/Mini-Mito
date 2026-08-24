@@ -11,10 +11,11 @@ LSM-Tree（Log-Structured Merge-Tree）是现代高性能数据库（如 Greptim
 
 | 组件 | 说明 |
 | :--- | :--- |
-| **预写日志（WAL）** | 二进制帧格式，整批一次写入；崩溃恢复容忍截断尾部；`SyncPolicy` 控制落盘强度（默认 Interval）。 |
-| **Memtable（列式）** | 按 series（tags）组织的列式缓冲，16 分片降低写锁竞争；追加写不去重，交给查询层按 seq 合并；`fork`/`freeze` 实现冻结。 |
+| **预写日志（WAL）** | 二进制帧格式（len + CRC-32 + payload），整批一次写入；崩溃恢复容忍截断尾部并校验每帧 CRC，损坏帧及其后内容安全丢弃；`SyncPolicy` 控制落盘强度（默认 Interval）。 |
+| **Memtable（列式）** | 按 series（tags）组织的列式缓冲，16 分片降低写锁竞争；值以 `Arc` 共享存储降低写放大与冻结拷贝开销；追加写不去重，交给查询层按 seq 合并；`fork`/`freeze` 实现 O(1) 冻结。 |
+| **快照隔离事务** | `Region::begin` 钉住时点快照，写缓冲本地暂存；提交时逐 key first-committer-wins 冲突检测，整个事务单帧落 WAL、在提交锁内原子应用——读者永不看到半截事务；未提交即丢弃自动回滚。 |
 | **Region & Version** | Region 管理 active/immutable/ssts 与 seq 水位；freeze 在写线程完成，Parquet 落盘与压缩由后台线程异步执行；查询基于不可变快照。 |
-| **SSTable** | Parquet 存储；索引含 bloom + row-group 元数据（键范围 + min_ts/max_ts）；内存 row-group 缓存加速点查；批级扫描支持时间范围剪枝与 tombstone 过滤。 |
+| **SSTable** | Parquet 存储；索引含 bloom + row-group 元数据（键范围 + min_ts/max_ts）；点查只解码所需列并配合有界行组缓存（FIFO）；批级扫描支持时间范围剪枝与列投影下推到 Parquet 解码层。 |
 | **Manifest 管理** | 记录所有 SSTable 元信息（ID、路径、键范围、条目数），原子写入；丢失时自动扫描目录重建 |
 | **时间范围谓词剪枝** | 从 DataFusion 过滤条件提取 `TimeRange`，对 sst、row-group 双层剪枝，并做行级 ts 过滤。 |
 | **TWCS 压缩 + TTL** | 按 `ts / window_size`（默认 1 小时）分窗，窗内 sst 数达 `compact_threshold`（默认 4）时合并；写路径自动触发压缩；TTL（默认关闭）在压缩时物理删除过期行，读路径按 `ttl_cutoff` 钳制。 |
@@ -27,6 +28,7 @@ LSM-Tree（Log-Structured Merge-Tree）是现代高性能数据库（如 Greptim
 - Rust 2024 Edition
 - `serde` + `serde_json` + `base64`
 - `datafusion`
+- `crc32fast`
 - `tokio` + `futures`
 - `rand`
 - `tempfile`
