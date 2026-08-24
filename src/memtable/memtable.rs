@@ -17,16 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     memtable::{
-        Wal,
-        columnar::ColumnarMemtable,
-        traits::{ImmutableMemtable, Memtable},
-        version::{Source, Version},
-        wal::Operation,
-    },
-    query::merge::MergeBatchIter,
-    schema::{BatchView, SemanticType, TableSchema},
-    sstable::sstable::{SSTable, SstableIndex, key_at, value_at},
-    types::{Key, Value},
+        Wal, columnar::ColumnarMemtable, traits::{ImmutableMemtable, Memtable}, transaction::{Transaction, TxError}, version::{Source, Version}, wal::Operation,
+    }, query::merge::MergeBatchIter, schema::{BatchView, SemanticType, TableSchema}, sstable::sstable::{SSTable, SstableIndex, key_at, value_at}, types::{Key, Value},
 };
 
 #[derive(Serialize, Deserialize)]
@@ -267,6 +259,7 @@ pub struct Region {
     manifest_path: PathBuf,
     schema: Arc<TableSchema>,
     write_gate: Arc<RwLock<()>>,
+    commit_gate: Arc<RwLock<()>>,
     ttl: Arc<AtomicI64>,
     window_size: Arc<AtomicI64>,
     compact_threshold: Arc<AtomicUsize>,
@@ -306,6 +299,7 @@ impl Region {
             manifest_path: manifest_path.clone(),
             schema,
             write_gate: Arc::new(RwLock::new(())),
+            commit_gate: Arc::new(RwLock::new(())),
             ttl: Arc::new(AtomicI64::new(i64::MIN)),
             window_size: Arc::new(AtomicI64::new(3_600_000_000_000)),
             compact_threshold: Arc::new(AtomicUsize::new(4)),
@@ -525,6 +519,7 @@ impl Region {
     }
 
     pub fn write_batch(&self, entries: Vec<(Key, Option<Value>)>) -> io::Result<()> {
+        let _commit_shared = self.commit_gate.read().unwrap();
         let n = entries.len() as u64;
         let start = self.seq.fetch_add(n, Ordering::SeqCst);
         let entries: Vec<(Key, u64, Option<Value>)> = entries
@@ -543,6 +538,7 @@ impl Region {
     }
 
     fn write_inner(&self, key: Key, value: Option<Value>) -> io::Result<Option<Value>> {
+        let _commit_shared = self.commit_gate.read().unwrap();
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
         let result = {
             let _gate = self.write_gate.read().unwrap();
@@ -552,6 +548,69 @@ impl Region {
         self.maybe_flush()?;
         self.maybe_compact()?;
         Ok(result)
+    }
+
+    pub fn begin(self: &Arc<Self>) -> io::Result<Transaction> {
+        let _commit_shared = self.commit_gate.read().unwrap();
+        let snapshot_seq = self.seq.load(Ordering::SeqCst);
+        let sources = self.snapshot_columnar_sources_inner(None, None)?;
+        Transaction::new(sources, snapshot_seq, &self.schema)
+    }
+
+    pub fn commit(&self, mut txn: Transaction) -> Result<(), TxError> {
+        if txn.writes.is_empty() {
+            txn.committed = true;
+            return Ok(());
+        }
+        let _wg = self.write_gate.read().unwrap();
+        let _cg = self.commit_gate.write().unwrap();
+        let v = self.version.lock().unwrap().clone();
+
+        for key in txn.writes.keys() {
+            if let Some(cur) = self.visible_seq(&v, key)? {
+                if cur >= txn.snapshot_seq {
+                    return Err(TxError::Conflict);
+                }
+            }
+        }
+
+        let start = self.seq.fetch_add(txn.writes.len() as u64, Ordering::SeqCst);
+        let entries: Vec<(Key, u64, Option<Value>)> = txn
+            .writes
+            .iter()
+            .enumerate()
+            .map(|(i, (key, value))| (key.clone(), start + i as u64, value.clone()))
+            .collect();
+        v.active.write_batch(entries)?;
+
+        txn.committed = true;
+        drop(_cg);
+        drop(_wg);
+        self.maybe_flush()?;
+        self.maybe_compact()?;
+        Ok(())
+    }
+
+    fn visible_seq(&self, v: &Arc<Version>, key: &Key) -> io::Result<Option<u64>> {
+        let mut best: Option<u64> = None;
+        if let Some((s, _)) = v.active.get(key)? {
+            best = Some(s);
+        }
+        for imm in v.immutables.iter().rev() {
+            if imm.max_seq() > best.unwrap_or(0)
+                && let Some((s, _)) = imm.get(key)?
+            {
+                best = Some(best.map_or(s, |b| b.max(s)));
+            }
+        }
+        for sst in v.ssts.iter().rev() {
+            if sst.max_seq() > best.unwrap_or(0)
+                && let Some((s, _)) = sst.get(key)?
+            {
+                best = Some(best.map_or(s, |b| b.max(s)));
+            }
+        }
+        Ok(best)
     }
 
     fn freeze_active(&self) -> io::Result<Option<Arc<dyn ImmutableMemtable>>> {
@@ -635,6 +694,7 @@ impl Region {
     }
 
     pub fn get(&self, key: Key) -> io::Result<Option<Value>> {
+        let _commit_shared = self.commit_gate.read().unwrap();
         if let Some(c) = self.ttl_cutoff()
             && key.1 < c
         {
@@ -734,6 +794,15 @@ impl Region {
     }
 
     pub fn snapshot_columnar_sources(
+        &self,
+        bounds: Option<(i64, i64)>,
+        user_cols: Option<&[usize]>,
+    ) -> io::Result<Vec<Source>> {
+        let _commit_shared = self.commit_gate.read().unwrap();
+        self.snapshot_columnar_sources_inner(bounds, user_cols)
+    }
+
+    fn snapshot_columnar_sources_inner(
         &self,
         bounds: Option<(i64, i64)>,
         user_cols: Option<&[usize]>,
