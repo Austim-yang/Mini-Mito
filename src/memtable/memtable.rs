@@ -557,7 +557,7 @@ impl Region {
     }
 
     pub fn write_batch(&self, entries: Vec<(Key, Option<Value>)>) -> io::Result<()> {
-        let _commit_shared = self.commit_gate.read().unwrap();
+        let _commit_exclusive = self.commit_gate.write().unwrap();
         let n = entries.len() as u64;
         let start = self.seq.fetch_add(n, Ordering::SeqCst);
         let entries: Vec<(Key, u64, Option<Value>)> = entries
@@ -570,15 +570,16 @@ impl Region {
             let v = self.version.lock().unwrap().clone();
             v.active.write_batch(entries)?;
         }
+        drop(_commit_exclusive);
         self.maybe_flush()?;
         self.maybe_compact()?;
         Ok(())
     }
 
     fn write_inner(&self, key: Key, value: Option<Value>) -> io::Result<Option<Value>> {
-        let _commit_shared = self.commit_gate.read().unwrap();
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
         let result = {
+            let _commit_shared = self.commit_gate.read().unwrap();
+            let seq = self.seq.fetch_add(1, Ordering::SeqCst);
             let _gate = self.write_gate.read().unwrap();
             let v = self.version.lock().unwrap().clone();
             v.active.write(key, seq, value)?
@@ -589,7 +590,7 @@ impl Region {
     }
 
     pub fn begin(self: &Arc<Self>) -> io::Result<Transaction> {
-        let _commit_shared = self.commit_gate.read().unwrap();
+        let _commit_exclusive = self.commit_gate.write().unwrap();
         let snapshot_seq = self.seq.load(Ordering::SeqCst);
         let sources = self.snapshot_columnar_sources_inner(None, None)?;
         Transaction::new(sources, snapshot_seq, &self.schema)
@@ -600,8 +601,8 @@ impl Region {
             txn.committed = true;
             return Ok(());
         }
-        let _wg = self.write_gate.read().unwrap();
         let _cg = self.commit_gate.write().unwrap();
+        let _wg = self.write_gate.read().unwrap();
         let v = self.version.lock().unwrap().clone();
 
         for key in txn.writes.keys() {
@@ -955,7 +956,7 @@ impl Drop for Region {
 
 #[cfg(test)]
 mod tests {
-    use std::assert_eq;
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::schema::{ColumnDef, SemanticType};
@@ -1795,5 +1796,64 @@ mod tests {
                 "PUT version resurrected after windowed compaction"
             );
         }
+    }
+
+    #[test]
+    fn test_txn_commit_mixed_with_autowrites_stays_live() {
+        let dir = tempdir().unwrap();
+        let region = Arc::new(Region::new(dir.path().join("region")).unwrap());
+
+        let worker = {
+            let region = region.clone();
+            std::thread::spawn(move || {
+                let mut handles = Vec::new();
+                for _ in 0..2 {
+                    let r = region.clone();
+                    handles.push(std::thread::spawn(move || {
+                        for _ in 0..50 {
+                            let mut txn = r.begin().unwrap();
+                            let cur = txn.get(&(vec![1], 0)).and_then(|v| {
+                                String::from_utf8(v)
+                                    .ok()
+                                    .and_then(|s| s.parse::<u64>().ok())
+                            });
+                            txn.write(
+                                (vec![1], 0),
+                                (cur.unwrap_or(0) + 1).to_string().into_bytes(),
+                            );
+                            r.commit(txn).ok();
+                        }
+                    }));
+                }
+                for t in 0..2u8 {
+                    let r = region.clone();
+                    handles.push(std::thread::spawn(move || {
+                        for i in 0..200u64 {
+                            r.write((vec![t + 10], i as i64), b"x".to_vec()).unwrap();
+                        }
+                    }));
+                }
+                for h in handles {
+                    h.join().unwrap();
+                }
+                let final_result = region.get((vec![1], 0)).unwrap().unwrap();
+                assert!(
+                    String::from_utf8(final_result)
+                        .unwrap()
+                        .parse::<u64>()
+                        .is_ok()
+                );
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !worker.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "deadlock suspected: mixed txn/autowrite did not finish in 15s"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        worker.join().unwrap();
     }
 }
