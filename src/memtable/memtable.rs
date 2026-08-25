@@ -1763,4 +1763,37 @@ mod tests {
         assert!(!dir.path().join("0003.sst.tmp").exists());
         assert!(!dir.path().join("manifest.tmp").exists());
     }
+
+    #[test]
+    fn test_deleted_key_stays_hidden_across_window_compaction() {
+        let dir = tempdir().unwrap();
+        let mut region = Region::new(dir.path().join("region")).unwrap();
+        region.set_window_size(50);
+        region.set_compact_threshold(2);
+
+        region.write((vec![7], 10), b"anchor".to_vec()).unwrap();
+        region.write((vec![7], 100), b"v1".to_vec()).unwrap();
+        region.flush().unwrap();
+        region.flush_barrier().unwrap();
+
+        region.delete((vec![7], 100)).unwrap();
+        region.write((vec![8], 130), b"w2b".to_vec()).unwrap();
+        region.flush().unwrap();
+        region.write((vec![9], 140), b"w2c".to_vec()).unwrap();
+        region.flush().unwrap();
+        region.flush_barrier().unwrap();
+
+        assert_eq!(
+            region.get((vec![7], 100)).unwrap(),
+            None,
+            "deleted key must stay dead"
+        );
+        for (_, v) in region.iter_all_data().unwrap() {
+            assert_ne!(
+                v.as_deref(),
+                Some(b"v1".as_slice()),
+                "PUT version resurrected after windowed compaction"
+            );
+        }
+    }
 }
